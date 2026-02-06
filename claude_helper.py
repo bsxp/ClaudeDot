@@ -32,6 +32,7 @@ STALE_THRESHOLD = 86400  # 24 hours
 DISCOVER_EVERY = 5  # run process discovery every N poll cycles
 
 
+
 def _read_config():
     try:
         with open(CONFIG_FILE, "r") as f:
@@ -332,13 +333,25 @@ class ClaudeHelperApp(rumps.App):
                     continue
 
     def _cleanup_stale_pending(self):
-        """Remove pending requests whose hook process has exited (PID-based, permissions only)."""
+        """Remove pending requests whose hook process has exited or whose session has moved on."""
         stale_ids = []
         for request_id, req in self.pending_requests.items():
             pid = req.get("pid")
-            # Only PID-check permission requests (elicitations have no PID)
+            # PID-based cleanup: hook process died without cleaning up
             if pid and not _pid_alive(pid):
                 stale_ids.append(request_id)
+                continue
+            # Status-based cleanup: session has moved past this request
+            sid = req.get("session_id", req.get("_session_id", ""))
+            session = self.sessions.get(sid, {})
+            session_status = session.get("status")
+            if req.get("type") == "elicitation":
+                if session_status != "question":
+                    stale_ids.append(request_id)
+            else:
+                # Permission requests — stale if session is no longer waiting for permission
+                if session_status != "permission":
+                    stale_ids.append(request_id)
         for request_id in stale_ids:
             req = self.pending_requests.pop(request_id, None)
             if req:
@@ -413,7 +426,7 @@ class ClaudeHelperApp(rumps.App):
         elif status in ("done", "idle"):
             label = f"\U0001F7E1 {project} — {status}"
         else:
-            label = f"\U0001F7E2 {project}"
+            label = f"\u231B {project}"
 
         session_menu = rumps.MenuItem(label)
 
