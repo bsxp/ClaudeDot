@@ -333,25 +333,24 @@ class ClaudeHelperApp(rumps.App):
                     continue
 
     def _cleanup_stale_pending(self):
-        """Remove pending requests whose hook process has exited or whose session has moved on."""
+        """Housekeeping: remove orphaned pending files. Does not affect display."""
         stale_ids = []
         for request_id, req in self.pending_requests.items():
             pid = req.get("pid")
-            # PID-based cleanup: hook process died without cleaning up
-            if pid and not _pid_alive(pid):
-                stale_ids.append(request_id)
-                continue
-            # Status-based cleanup: session has moved past this request
             sid = req.get("session_id", req.get("_session_id", ""))
             session = self.sessions.get(sid, {})
             session_status = session.get("status")
-            if req.get("type") == "elicitation":
-                if session_status != "question":
-                    stale_ids.append(request_id)
-            else:
-                # Permission requests — stale if session is no longer waiting for permission
-                if session_status != "permission":
-                    stale_ids.append(request_id)
+            # Hook process died without cleaning up its file
+            if pid and not _pid_alive(pid):
+                stale_ids.append(request_id)
+            # Session has moved past this request
+            elif req.get("type") == "elicitation" and session_status != "question":
+                stale_ids.append(request_id)
+            elif req.get("type") != "elicitation" and session_status != "permission":
+                stale_ids.append(request_id)
+            # Session no longer exists
+            elif not session:
+                stale_ids.append(request_id)
         for request_id in stale_ids:
             req = self.pending_requests.pop(request_id, None)
             if req:
@@ -363,13 +362,14 @@ class ClaudeHelperApp(rumps.App):
                     pass
 
     def _update_icon(self):
-        """Update menu bar icon based on session states."""
-        has_actionable = (
-            any(s.get("status") in ("permission", "question") for s in self.sessions.values())
-            or len(self.pending_requests) > 0
+        """Update menu bar icon based on session info.json status only."""
+        has_actionable = any(
+            s.get("status") in ("permission", "question")
+            for s in self.sessions.values()
         )
         has_waiting = any(
-            s.get("status") in ("done", "idle") for s in self.sessions.values()
+            s.get("status") in ("done", "idle")
+            for s in self.sessions.values()
         )
 
         if has_actionable:
@@ -418,10 +418,10 @@ class ClaudeHelperApp(rumps.App):
         elicitations = {rid: r for rid, r in session_requests.items() if r.get("type") == "elicitation"}
         permissions = {rid: r for rid, r in session_requests.items() if r.get("type") != "elicitation"}
 
-        # Session label with status icons
-        if elicitations:
+        # Session label — driven by info.json status only
+        if status == "question":
             label = f"\U0001F535 {project} — question"
-        elif status == "permission" or permissions:
+        elif status == "permission":
             label = f"\U0001F534 {project} — permission needed"
         elif status in ("done", "idle"):
             label = f"\U0001F7E1 {project} — {status}"
@@ -453,18 +453,16 @@ class ClaudeHelperApp(rumps.App):
 
                 session_menu.add(q_menu)
 
-        # Permission requests — interactive (Allow/Deny/Always Allow)
+        # Permission requests — interactive (Yes/No)
         for request_id, request in permissions.items():
             desc = request.get("description", "Permission request")
             req_menu = rumps.MenuItem(desc)
 
-            allow_cb = self._make_decision_callback(request_id, "allow")
-            always_cb = self._make_decision_callback(request_id, "always_allow")
-            deny_cb = self._make_decision_callback(request_id, "deny")
+            yes_cb = self._make_decision_callback(request_id, "allow")
+            no_cb = self._make_decision_callback(request_id, "deny")
 
-            req_menu.add(rumps.MenuItem("Allow", callback=allow_cb))
-            req_menu.add(rumps.MenuItem("Always Allow", callback=always_cb))
-            req_menu.add(rumps.MenuItem("Deny", callback=deny_cb))
+            req_menu.add(rumps.MenuItem("Yes", callback=yes_cb))
+            req_menu.add(rumps.MenuItem("No", callback=no_cb))
             session_menu.add(req_menu)
 
         if not session_requests:
