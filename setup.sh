@@ -35,6 +35,7 @@ chmod +x "$SCRIPT_DIR/hooks/prompt_submit.sh"
 chmod +x "$SCRIPT_DIR/hooks/permission_request.py"
 chmod +x "$SCRIPT_DIR/hooks/elicitation_request.py"
 chmod +x "$SCRIPT_DIR/hooks/elicitation_cleanup.sh"
+chmod +x "$SCRIPT_DIR/hooks/tool_activity.sh"
 chmod +x "$SCRIPT_DIR/hooks/notification.sh"
 chmod +x "$SCRIPT_DIR/hooks/stop.sh"
 echo "  ✓ All hooks are executable"
@@ -104,6 +105,15 @@ HOOKS_CONFIG=$(cat <<ENDJSON
           {
             "type": "command",
             "command": "$SCRIPT_DIR/hooks/elicitation_cleanup.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$SCRIPT_DIR/hooks/tool_activity.sh"
           }
         ]
       }
