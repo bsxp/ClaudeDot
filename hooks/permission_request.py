@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Hook: PermissionRequest — BLOCKING hook that polls for menu bar response.
+Hook: PermissionRequest — handles permission prompts via system tray.
 
-Writes pending request details to the session's pending directory,
-then polls for a response file written by the menu bar app.
-Times out after 5 minutes, causing Claude Code to fall back to the terminal dialog.
+Behavior depends on the client type detected at session start:
+- VS Code: Non-blocking. Writes notification to tray (blue icon), lets VS Code
+  show its native permission dialog.
+- Terminal: Blocking. Polls for a system tray response (Allow/Deny).
+  Times out after 5 minutes, falling back to the terminal dialog.
 """
 
 import json
@@ -47,6 +49,11 @@ def main():
     tool_name = input_data.get("tool_name", "unknown")
     tool_input = input_data.get("tool_input", {})
 
+    # AskUserQuestion is handled by elicitation_request.py (PreToolUse hook),
+    # not the permission system. Let Claude Code handle it normally.
+    if tool_name == "AskUserQuestion":
+        sys.exit(1)
+
     # Build a human-readable description of the request
     description = _describe_request(tool_name, tool_input)
 
@@ -54,18 +61,41 @@ def main():
     response_file = os.path.join(RESPONSES_DIR, f"{request_id}.json")
     info_file = os.path.join(session_dir, "info.json")
 
+    # Check client type from session info (fall back to env var detection)
+    client = _detect_client(info_file)
+
+    # VS Code handles permissions natively — exit immediately.
+    # Only set "permission" status for Bash (the main tool that shows a
+    # permission dialog). Auto-approved tools (Read/Edit/Write) don't need it.
+    # PostToolUse (tool_activity.py) resets status to "working" once the tool
+    # completes, so the blue dot clears automatically.
+    if client == "vscode":
+        if tool_name == "Bash":
+            _update_session_status(info_file, "permission")
+        sys.exit(1)
+
+    _run_terminal_mode(request_id, session_id, tool_name, tool_input,
+                       description, pending_file, response_file, info_file)
+
+
+def _run_terminal_mode(request_id, session_id, tool_name, tool_input,
+                       description, pending_file, response_file, info_file):
+    """Blocking: poll for system tray response."""
     # Register signal handlers so cleanup runs even on SIGTERM
     def _handle_signal(signum, frame):
         _cleanup(pending_file, response_file)
-        _update_session_status(info_file, "working")
+        # Keep status as "permission" — the prompt falls back to the terminal
+        # and is still pending. PostToolUse will reset when resolved.
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGHUP, _handle_signal)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _handle_signal)
 
-    # Write pending request (include PID so menu bar can detect stale requests)
+    # Write pending request (include PID so system tray can detect stale requests)
     request_data = {
         "id": request_id,
+        "type": "permission",
         "session_id": session_id,
         "pid": os.getpid(),
         "tool_name": tool_name,
@@ -77,18 +107,7 @@ def main():
     with open(pending_file, "w") as f:
         json.dump(request_data, f)
 
-    # Update session info to reflect permission-needed status
-    if os.path.isfile(info_file):
-        try:
-            with open(info_file, "r") as f:
-                info = json.load(f)
-            info["status"] = "permission"
-            info["waiting_for"] = "permission"
-            info["last_updated"] = int(time.time())
-            with open(info_file, "w") as f:
-                json.dump(info, f)
-        except (json.JSONDecodeError, IOError):
-            pass
+    _update_session_status(info_file, "permission")
 
     # Poll for response
     start_time = time.time()
@@ -110,20 +129,20 @@ def main():
                 _update_session_status(info_file, "working")
 
                 # Output the decision in Claude Code's expected format
-                decision = response.get("decision", "deny")
-                # Map menu bar decisions to Claude Code's permissionDecision values
+                raw_decision = response.get("decision", "deny")
                 decision_map = {
                     "allow": "allow",
                     "always_allow": "allow",
                     "deny": "deny",
                 }
-                perm_decision = decision_map.get(decision, "deny")
-                reason = "Approved via Claude Helper menu bar" if perm_decision == "allow" else "Denied via Claude Helper menu bar"
+                behavior = decision_map.get(raw_decision, "deny")
+                decision_obj = {"behavior": behavior}
+                if behavior == "deny":
+                    decision_obj["message"] = "Denied via Claude Helper system tray"
                 output = {
                     "hookSpecificOutput": {
                         "hookEventName": "PermissionRequest",
-                        "permissionDecision": perm_decision,
-                        "permissionDecisionReason": reason,
+                        "decision": decision_obj,
                     }
                 }
                 print(json.dumps(output))
@@ -136,10 +155,27 @@ def main():
     finally:
         # Clean up pending file on timeout or interruption
         _cleanup(pending_file, response_file)
-        _update_session_status(info_file, "working")
+        # Keep status as "permission" — the prompt falls back to the terminal
+        # and is still pending. PostToolUse will reset when resolved.
 
     # Timeout — exit 1 so Claude Code falls back to terminal
     sys.exit(1)
+
+
+def _detect_client(info_file):
+    """Detect whether running in VS Code or a standalone terminal."""
+    try:
+        with open(info_file, "r") as f:
+            client = json.load(f).get("client")
+            if client:
+                return client
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        pass
+    # Fallback: check environment variables
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    if "vscode" in entrypoint or os.environ.get("VSCODE_PID"):
+        return "vscode"
+    return "terminal"
 
 
 def _describe_request(tool_name, tool_input):
