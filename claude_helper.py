@@ -22,12 +22,14 @@ STATE_DIR = os.path.expanduser("~/.claude-helper")
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 RESPONSES_DIR = os.path.join(STATE_DIR, "responses")
 ICONS_DIR = os.path.join(STATE_DIR, "icons")
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 LAUNCHD_LABEL = "com.claude-helper"
 PLIST_DEST = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
 
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 POLL_INTERVAL = 2  # seconds
 STALE_THRESHOLD = 86400  # 24 hours
+DISCOVER_EVERY = 5  # run process discovery every N poll cycles
 
 
 def _read_config():
@@ -154,12 +156,17 @@ class ClaudeHelperApp(rumps.App):
         self.elicitation_mode_item = rumps.MenuItem("Questions: Terminal", callback=self._toggle_elicitation_mode)
         self._refresh_elicitation_mode()
 
+        self._discover_counter = DISCOVER_EVERY  # trigger on first poll
         self.timer = rumps.Timer(self._poll, POLL_INTERVAL)
         self.timer.start()
 
         self._cleanup_stale_sessions()
 
     def _poll(self, _=None):
+        self._discover_counter += 1
+        if self._discover_counter >= DISCOVER_EVERY:
+            self._discover_counter = 0
+            self._discover_unregistered_sessions()
         self._read_sessions()
         self._cleanup_dead_sessions()
         self._read_pending_requests()
@@ -194,6 +201,114 @@ class ClaudeHelperApp(rumps.App):
         for session_id in dead:
             del self.sessions[session_id]
             _rmtree(os.path.join(SESSIONS_DIR, session_id))
+
+    def _discover_unregistered_sessions(self):
+        """Find running Claude processes not yet registered via hooks."""
+        # Find all claude PIDs and their working directories
+        try:
+            ps_result = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                capture_output=True, text=True, timeout=5,
+            )
+            if ps_result.returncode != 0:
+                return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+
+        claude_pids = []
+        for line in ps_result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            pid_str, cmd = parts
+            cmd_base = cmd.split()[0] if cmd else ""
+            if os.path.basename(cmd_base) == "claude":
+                try:
+                    claude_pids.append(int(pid_str))
+                except ValueError:
+                    continue
+
+        if not claude_pids:
+            return
+
+        # Filter out PIDs already registered
+        registered_pids = {
+            data.get("parent_pid") for data in self.sessions.values()
+        }
+        unregistered = [p for p in claude_pids if p not in registered_pids]
+        if not unregistered:
+            return
+
+        # Get working directories via lsof
+        try:
+            pids_arg = ",".join(str(p) for p in unregistered)
+            lsof_result = subprocess.run(
+                ["lsof", "-a", "-p", pids_arg, "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+
+        pid_cwd = {}
+        current_pid = None
+        for line in lsof_result.stdout.strip().split("\n"):
+            if line.startswith("p"):
+                try:
+                    current_pid = int(line[1:])
+                except ValueError:
+                    current_pid = None
+            elif line.startswith("n") and current_pid is not None:
+                pid_cwd[current_pid] = line[1:]
+                current_pid = None
+
+        for pid, cwd in pid_cwd.items():
+            # Map cwd to Claude project directory
+            project_dir_name = cwd.replace("/", "-")
+            project_dir = os.path.join(CLAUDE_PROJECTS_DIR, project_dir_name)
+            if not os.path.isdir(project_dir):
+                continue
+
+            # Find the most recently modified session .jsonl file
+            best_sid = None
+            best_mtime = 0
+            try:
+                for fname in os.listdir(project_dir):
+                    if not fname.endswith(".jsonl"):
+                        continue
+                    fpath = os.path.join(project_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                        if mtime > best_mtime:
+                            best_mtime = mtime
+                            best_sid = fname[:-6]  # strip .jsonl
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+
+            if not best_sid or best_sid in self.sessions:
+                continue
+
+            # Register the discovered session
+            session_dir = os.path.join(SESSIONS_DIR, best_sid)
+            os.makedirs(os.path.join(session_dir, "pending"), exist_ok=True)
+            info = {
+                "session_id": best_sid,
+                "cwd": cwd,
+                "project_name": os.path.basename(cwd),
+                "parent_pid": pid,
+                "status": "working",
+                "waiting_for": None,
+                "last_updated": int(time.time()),
+            }
+            try:
+                with open(os.path.join(session_dir, "info.json"), "w") as f:
+                    json.dump(info, f, indent=4)
+            except IOError:
+                continue
 
     def _read_pending_requests(self):
         self.pending_requests = {}
