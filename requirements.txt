@@ -1,3 +1,4 @@
 pystray
 Pillow
 psutil
+winotify; sys_platform == "win32"

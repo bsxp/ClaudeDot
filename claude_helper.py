@@ -20,9 +20,13 @@ import psutil
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
+if sys.platform == "win32":
+    from winotify import Notification as WinNotification
+
 STATE_DIR = os.path.expanduser("~/.claude-helper")
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 RESPONSES_DIR = os.path.join(STATE_DIR, "responses")
+NOTIFY_DIR = os.path.join(STATE_DIR, "notify")
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
@@ -96,11 +100,12 @@ def _generate_dot_image(color, filled, size=64):
 
 
 def _ensure_icons():
-    """Generate system tray icons. Returns (empty, filled, blue) PIL Images."""
-    empty = _generate_dot_image((180, 180, 180, 255), filled=False)
-    filled = _generate_dot_image((180, 180, 180, 255), filled=True)
-    blue = _generate_dot_image((59, 130, 246, 255), filled=True)
-    return empty, filled, blue
+    """Generate system tray icons. Returns (empty, green, blue, yellow) PIL Images."""
+    empty = _generate_dot_image((180, 180, 180, 255), filled=False)   # gray hollow
+    green = _generate_dot_image((34, 197, 94, 255), filled=True)      # green filled
+    blue = _generate_dot_image((59, 130, 246, 255), filled=True)      # blue filled
+    yellow = _generate_dot_image((234, 179, 8, 255), filled=True)     # yellow filled
+    return empty, green, blue, yellow
 
 
 _emoji_font_cache = {}
@@ -193,7 +198,7 @@ def _pid_alive(pid):
 
 class ClaudeHelperApp:
     def __init__(self):
-        self.icon_empty, self.icon_filled, self.icon_blue = _ensure_icons()
+        self.icon_empty, self.icon_green, self.icon_blue, self.icon_yellow = _ensure_icons()
         self.sessions = {}
         self.pending_requests = {}
         self._discover_counter = DISCOVER_EVERY  # trigger on first poll
@@ -237,6 +242,8 @@ class ClaudeHelperApp:
             self._cleanup_dead_sessions()
             self._read_pending_requests()
             self._cleanup_stale_pending()
+            self._heal_stale_permission()
+            self._process_notify_queue()
             self._update_icon()
             self._rebuild_menu()
 
@@ -412,34 +419,158 @@ class ClaudeHelperApp:
                 except FileNotFoundError:
                     pass
 
+    def _heal_stale_permission(self):
+        """Reset 'permission' status if no pending request exists for the session.
+
+        In VS Code mode, the PermissionRequest hook sets 'permission' and exits
+        immediately without creating a pending file. PostToolUse should reset it,
+        but if that hook doesn't fire, the status stays stuck. This self-heals by
+        checking: if status is 'permission' for >10s with no pending request, reset.
+        """
+        now = int(time.time())
+        for sid, session in self.sessions.items():
+            if session.get("status") != "permission":
+                continue
+            last = session.get("last_updated", 0)
+            if now - last < 10:
+                continue
+            # Check if there's an active pending permission request
+            has_pending = any(
+                req.get("session_id", req.get("_session_id", "")) == sid
+                and req.get("type") != "elicitation"
+                for req in self.pending_requests.values()
+            )
+            if has_pending:
+                continue
+            # No pending request and stale — reset to working
+            info_file = os.path.join(SESSIONS_DIR, sid, "info.json")
+            try:
+                with open(info_file, "r") as f:
+                    info = json.load(f)
+                info["status"] = "working"
+                info["waiting_for"] = None
+                info["last_updated"] = now
+                with open(info_file, "w") as f:
+                    json.dump(info, f, indent=4)
+                session["status"] = "working"
+            except (json.JSONDecodeError, IOError):
+                pass
+
+    def _get_notification_icon_path(self, status):
+        """Get (or create) a cached PNG of the user's chosen emoji for a status."""
+        emoji = self._get_status_icon(status)
+        cache_dir = os.path.join(STATE_DIR, "icon_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        # Use codepoint as filename so it updates when the user changes icons
+        codepoints = "-".join(f"{ord(c):x}" for c in emoji)
+        png_path = os.path.join(cache_dir, f"{status}_{codepoints}.png")
+        if os.path.isfile(png_path):
+            return png_path
+        # Render emoji to PNG (large size for crisp Windows toasts)
+        size = 256
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        rendered = False
+        font = _load_emoji_font(size - 16)
+        if font:
+            draw = ImageDraw.Draw(img)
+            bbox = draw.textbbox((0, 0), emoji, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x = (size - tw) // 2 - bbox[0]
+            y = (size - th) // 2 - bbox[1]
+            draw.text((x, y), emoji, font=font, embedded_color=True)
+            # Check if the emoji rendered as a proper color emoji
+            # (not a monochrome glyph like ✔️ on Windows)
+            pixels = [(r, g, b) for r, g, b, a in img.getdata() if a > 128]
+            if pixels:
+                rs, gs, bs = zip(*pixels)
+                color_range = max(max(rs) - min(rs), max(gs) - min(gs), max(bs) - min(bs))
+                rendered = color_range > 100
+        if not rendered:
+            # Fallback: colored circle matching tray icon colors
+            img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            colors = {
+                "permission": (59, 130, 246, 255),
+                "question": (59, 130, 246, 255),
+                "done": (234, 179, 8, 255),
+                "idle": (234, 179, 8, 255),
+                "working": (34, 197, 94, 255),
+            }
+            color = colors.get(status, (180, 180, 180, 255))
+            margin = size // 8
+            draw.ellipse([margin, margin, size - margin, size - margin], fill=color)
+        try:
+            img.save(png_path, "PNG")
+        except Exception:
+            return None
+        return png_path
+
+    def _process_notify_queue(self):
+        """Read notification requests from the queue directory and fire them."""
+        if not os.path.isdir(NOTIFY_DIR):
+            return
+        config = _read_config()
+        notif = config.get("notifications", {
+            "permission": True,
+            "question": True,
+            "done": True,
+        })
+        for fname in os.listdir(NOTIFY_DIR):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(NOTIFY_DIR, fname)
+            try:
+                with open(fpath, "r") as f:
+                    data = json.load(f)
+                os.unlink(fpath)
+            except (json.JSONDecodeError, IOError, OSError):
+                try:
+                    os.unlink(fpath)
+                except OSError:
+                    pass
+                continue
+            ntype = data.get("type", "")
+            message = data.get("message", "")
+            if not message:
+                continue
+            # Check per-event toggle
+            if ntype in notif and not notif[ntype]:
+                continue
+            try:
+                if IS_WINDOWS:
+                    icon_path = self._get_notification_icon_path(ntype)
+                    kwargs = {
+                        "app_id": "Claude Helper",
+                        "title": "Claude Helper",
+                        "msg": message,
+                    }
+                    if icon_path:
+                        kwargs["icon"] = icon_path
+                    toast = WinNotification(**kwargs)
+                    toast.show()
+                else:
+                    self.icon.notify(message, "Claude Helper")
+            except Exception:
+                pass
+
     def _update_icon(self):
         """Update tray icon based on aggregate session status.
 
-        Blue ring + emoji = needs attention (permission / question)
-        Filled gray dot   = session idle/done (user should check)
-        Hollow gray ring  = no sessions or all working
-
-        Icon is driven ONLY by info.json status — pending files never
-        influence icon state (they are sub-menu content only).
+        Blue filled   = needs attention (permission / question)
+        Green filled  = Claude is actively working
+        Yellow filled = idle / done (waiting for user input)
+        Gray hollow   = no active sessions
         """
-        # Find the highest-priority notable status
-        for status in ("question", "permission", "done", "idle"):
-            if any(s.get("status") == status for s in self.sessions.values()):
-                if status in ("question", "permission"):
-                    emoji = self._get_status_icon(status)
-                    ring_color = (59, 130, 246, 255)   # blue
-                    cache_key = (emoji, ring_color)
-                    if cache_key not in self._icon_cache:
-                        self._icon_cache[cache_key] = _generate_emoji_ring_icon(
-                            emoji, ring_color,
-                        )
-                    self.icon.icon = self._icon_cache[cache_key]
-                else:
-                    # done/idle → filled dot (user should go check)
-                    self.icon.icon = self.icon_filled
-                return
+        statuses = [s.get("status") for s in self.sessions.values()]
 
-        self.icon.icon = self.icon_empty
+        if any(s in ("question", "permission") for s in statuses):
+            self.icon.icon = self.icon_blue
+        elif any(s == "working" for s in statuses):
+            self.icon.icon = self.icon_green
+        elif any(s in ("done", "idle") for s in statuses):
+            self.icon.icon = self.icon_yellow
+        else:
+            self.icon.icon = self.icon_empty
 
     def _rebuild_menu(self):
         """Rebuild the tray menu with current session state."""
@@ -470,6 +601,9 @@ class ClaudeHelperApp:
         elicitation_label = f"Questions: {'Tray' if elicitation_mode == 'menubar' else 'Terminal'}"
         items.append(pystray.MenuItem(elicitation_label, self._toggle_elicitation_mode))
 
+        # Notifications submenu
+        items.append(self._build_notifications_menu())
+
         # Status icons submenu
         items.append(self._build_status_icons_menu())
 
@@ -486,6 +620,48 @@ class ClaudeHelperApp:
         config = _read_config()
         icons = config.get("status_icons", {})
         return icons.get(status, DEFAULT_STATUS_ICONS.get(status, "\u2753"))
+
+    def _build_notifications_menu(self):
+        """Build the Notifications submenu with per-event toggles."""
+        config = _read_config()
+        notif = config.get("notifications", {
+            "permission": True,
+            "question": True,
+            "done": True,
+        })
+
+        def make_toggle(key):
+            def toggle(icon, item):
+                c = _read_config()
+                n = c.get("notifications", {
+                    "permission": True,
+                    "question": True,
+                    "done": True,
+                })
+                n[key] = not n.get(key, True)
+                c["notifications"] = n
+                _write_config(c)
+            return toggle
+
+        def make_checked(key):
+            def checked(item):
+                c = _read_config()
+                n = c.get("notifications", {
+                    "permission": True,
+                    "question": True,
+                    "done": True,
+                })
+                return n.get(key, True)
+            return checked
+
+        return pystray.MenuItem("Notifications", pystray.Menu(
+            pystray.MenuItem("Permission", make_toggle("permission"),
+                             checked=make_checked("permission")),
+            pystray.MenuItem("Questions", make_toggle("question"),
+                             checked=make_checked("question")),
+            pystray.MenuItem("Done", make_toggle("done"),
+                             checked=make_checked("done")),
+        ))
 
     def _build_session_menu(self, session_id, session):
         """Build a submenu for a single session."""

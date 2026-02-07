@@ -85,6 +85,18 @@ def _update_session_status(info_file, status, waiting_for):
         pass
 
 
+def _enqueue_notification(ntype, message):
+    """Write a notification request for the tray app to pick up."""
+    notify_dir = os.path.join(STATE_DIR, "notify")
+    os.makedirs(notify_dir, exist_ok=True)
+    nfile = os.path.join(notify_dir, f"{uuid.uuid4()}.json")
+    try:
+        with open(nfile, "w") as f:
+            json.dump({"type": ntype, "message": message}, f)
+    except IOError:
+        pass
+
+
 def _cleanup(*files):
     for f in files:
         try:
@@ -124,6 +136,16 @@ def main():
     info_file = os.path.join(session_dir, "info.json")
 
     mode = _get_mode(info_file)
+
+    # Enqueue a notification for the tray app
+    project = "Claude"
+    try:
+        with open(info_file, "r") as f:
+            project = json.load(f).get("project_name", "Claude")
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        pass
+    q_summary = question_data[0]["question"] if question_data else "Question"
+    _enqueue_notification("question", f"{project} — asking a question\n{q_summary}")
 
     if mode == "menubar":
         _run_menubar_mode(request_id, session_id, question_data, pending_file, info_file)

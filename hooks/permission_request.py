@@ -64,6 +64,14 @@ def main():
     # Check client type from session info (fall back to env var detection)
     client = _detect_client(info_file)
 
+    # Read project name for notification messages
+    project = "Claude"
+    try:
+        with open(info_file, "r") as f:
+            project = json.load(f).get("project_name", "Claude")
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        pass
+
     # VS Code handles permissions natively — exit immediately.
     # Only set "permission" status for Bash (the main tool that shows a
     # permission dialog). Auto-approved tools (Read/Edit/Write) don't need it.
@@ -72,8 +80,10 @@ def main():
     if client == "vscode":
         if tool_name == "Bash":
             _update_session_status(info_file, "permission")
+            _enqueue_notification("permission", f"{project} — needs permission\n{description}")
         sys.exit(1)
 
+    _enqueue_notification("permission", f"{project} — needs permission\n{description}")
     _run_terminal_mode(request_id, session_id, tool_name, tool_input,
                        description, pending_file, response_file, info_file)
 
@@ -209,6 +219,18 @@ def _cleanup(pending_file, response_file):
             os.unlink(f)
         except FileNotFoundError:
             pass
+
+
+def _enqueue_notification(ntype, message):
+    """Write a notification request for the tray app to pick up."""
+    notify_dir = os.path.join(STATE_DIR, "notify")
+    os.makedirs(notify_dir, exist_ok=True)
+    nfile = os.path.join(notify_dir, f"{uuid.uuid4()}.json")
+    try:
+        with open(nfile, "w") as f:
+            json.dump({"type": ntype, "message": message}, f)
+    except IOError:
+        pass
 
 
 def _update_session_status(info_file, status):
