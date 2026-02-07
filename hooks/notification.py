@@ -29,28 +29,25 @@ def main():
     ntype = input_data.get("notification_type", "")
     title = input_data.get("title", "notification")
 
-    # Determine waiting_for and status based on notification type or title
-    match = ntype or title
-    match_lower = match.lower()
-
-    if "permission" in match_lower:
-        waiting_for = "permission"
-        status = "permission"
-    elif "idle" in match_lower or "input" in match_lower:
+    # Determine waiting_for based on notification type or title
+    match = (ntype or title).lower()
+    if "idle" in match or "input" in match:
         waiting_for = "input"
-        status = "idle"
-    elif "elicitation" in match_lower:
+    elif "elicitation" in match:
         waiting_for = "elicitation"
-        status = "idle"
     else:
         waiting_for = title
-        status = "idle"
 
     try:
         with open(info_file, "r") as f:
             info = json.load(f)
+        # Don't overwrite active permission/question status —
+        # those are managed by their own hooks and should persist
+        # until explicitly cleared by tool_activity or the tray app.
+        if info.get("status") in ("permission", "question"):
+            sys.exit(0)
+        info["status"] = "idle"
         info["waiting_for"] = waiting_for
-        info["status"] = status
         info["last_updated"] = int(time.time())
         with open(info_file, "w") as f:
             json.dump(info, f, indent=4)
