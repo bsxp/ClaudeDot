@@ -23,12 +23,15 @@ Works on **macOS** and **Windows**.
 
 ## Tray Icons
 
-| Icon | Meaning |
-|------|---------|
-| Gray hollow circle | No active sessions |
-| Green filled circle | Claude is actively working |
-| Blue filled circle | A session needs your attention (permission request or question) |
-| Yellow filled circle | A session has finished or is idle, waiting for input |
+| Icon | Meaning | Default Emoji |
+|------|---------|---------------|
+| Gray hollow circle | No active sessions | — |
+| Gray circle filling up/down (animated) | Claude is actively working | ⌛ |
+| Blue ring with emoji | A session needs permission (e.g. tool use approval) | 🔴 |
+| Blue ring with emoji | A session has a question for you | 🔵 |
+| Filled gray circle | A session has finished or is idle, waiting for your input | 🟡 |
+
+Status emojis are customizable via the **Status Icons** submenu in the tray.
 
 ## Setup
 
