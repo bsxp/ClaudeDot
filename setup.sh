@@ -22,8 +22,9 @@ echo "  + dependencies installed (pystray, Pillow, psutil)"
 # 2. Create state directories
 echo ""
 echo "[2/4] Creating state directories..."
-mkdir -p "$STATE_DIR/sessions"
-mkdir -p "$STATE_DIR/responses"
+mkdir -p -m 700 "$STATE_DIR"
+mkdir -p -m 700 "$STATE_DIR/sessions"
+mkdir -p -m 700 "$STATE_DIR/responses"
 echo "  + $STATE_DIR/sessions"
 echo "  + $STATE_DIR/responses"
 

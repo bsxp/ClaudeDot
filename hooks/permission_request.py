@@ -11,6 +11,7 @@ Behavior depends on the client type detected at session start:
 
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -18,6 +19,7 @@ import uuid
 
 STATE_DIR = os.path.expanduser("~/.claude-helper")
 RESPONSES_DIR = os.path.join(STATE_DIR, "responses")
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
 POLL_INTERVAL = 0.5  # seconds
 TIMEOUT = 300  # 5 minutes
 
@@ -29,7 +31,7 @@ def main():
         sys.exit(1)
 
     session_id = input_data.get("session_id", "")
-    if not session_id:
+    if not session_id or not _SAFE_ID.match(session_id):
         sys.exit(1)
 
     session_dir = os.path.join(STATE_DIR, "sessions", session_id)
@@ -39,8 +41,8 @@ def main():
         # Session not registered — let terminal handle it
         sys.exit(1)
 
-    os.makedirs(pending_dir, exist_ok=True)
-    os.makedirs(RESPONSES_DIR, exist_ok=True)
+    os.makedirs(pending_dir, mode=0o700, exist_ok=True)
+    os.makedirs(RESPONSES_DIR, mode=0o700, exist_ok=True)
 
     # Generate a unique request ID
     request_id = str(uuid.uuid4())

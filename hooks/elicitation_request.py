@@ -13,6 +13,7 @@ Can be overridden via elicitation_mode in ~/.claude-helper/config.json.
 
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -21,6 +22,7 @@ import uuid
 STATE_DIR = os.path.expanduser("~/.claude-helper")
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 RESPONSES_DIR = os.path.join(STATE_DIR, "responses")
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
 POLL_INTERVAL = 0.5
 TIMEOUT = 300
 
@@ -100,7 +102,7 @@ def main():
         sys.exit(0)
 
     session_id = input_data.get("session_id", "")
-    if not session_id:
+    if not session_id or not _SAFE_ID.match(session_id):
         sys.exit(0)
 
     tool_name = input_data.get("tool_name", "")
@@ -116,7 +118,7 @@ def main():
     if not os.path.isdir(session_dir):
         sys.exit(0)
 
-    os.makedirs(pending_dir, exist_ok=True)
+    os.makedirs(pending_dir, mode=0o700, exist_ok=True)
 
     request_id = str(uuid.uuid4())
     question_data = _build_question_data(questions)
@@ -149,7 +151,7 @@ def _run_terminal_mode(request_id, session_id, question_data, pending_file, info
 
 def _run_menubar_mode(request_id, session_id, question_data, pending_file, info_file):
     """Blocking: write pending, poll for system tray answer, deny with context."""
-    os.makedirs(RESPONSES_DIR, exist_ok=True)
+    os.makedirs(RESPONSES_DIR, mode=0o700, exist_ok=True)
     response_file = os.path.join(RESPONSES_DIR, f"{request_id}.json")
 
     def _handle_signal(signum, frame):

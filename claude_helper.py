@@ -11,6 +11,7 @@ Supports macOS (menu bar) and Windows (system tray).
 
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -18,17 +19,17 @@ import time
 
 import psutil
 import pystray
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 STATE_DIR = os.path.expanduser("~/.claude-helper")
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 RESPONSES_DIR = os.path.join(STATE_DIR, "responses")
-CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 POLL_INTERVAL = 2  # seconds
 STALE_THRESHOLD = 86400  # 24 hours
-DISCOVER_EVERY = 5  # run process discovery every N poll cycles
+
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
 
 IS_MACOS = sys.platform == "darwin"
 IS_WINDOWS = sys.platform == "win32"
@@ -74,7 +75,7 @@ def _read_config():
 
 
 def _write_config(config):
-    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
@@ -95,12 +96,56 @@ def _generate_dot_image(color, filled, size=64):
     return image
 
 
+def _generate_fill_frame(color, fill_level, size=64):
+    """Generate a circle partially filled from the bottom.
+
+    fill_level: 0.0 (outline only) to 1.0 (fully filled).
+    """
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    margin = int(size * 0.15)
+    bbox = [margin, margin, size - margin, size - margin]
+    stroke_width = max(2, size // 16)
+
+    if fill_level >= 1.0:
+        draw.ellipse(bbox, fill=color)
+        return image
+
+    # Always draw outline
+    draw.ellipse(bbox, outline=color, width=stroke_width)
+
+    if fill_level <= 0:
+        return image
+
+    # Filled circle on a separate layer
+    filled = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ImageDraw.Draw(filled).ellipse(bbox, fill=color)
+
+    # Circle-shaped alpha mask
+    circle_mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(circle_mask).ellipse(bbox, fill=255)
+
+    # Rectangle mask — everything below the water line
+    circle_h = size - 2 * margin
+    cutoff_y = margin + int(circle_h * (1.0 - fill_level))
+    rect_mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(rect_mask).rectangle([0, cutoff_y, size, size], fill=255)
+
+    # Intersect the two masks
+    final_mask = ImageChops.multiply(circle_mask, rect_mask)
+
+    # Composite filled region onto the outline image
+    image = Image.composite(filled, image, final_mask)
+    return image
+
+
 def _ensure_icons():
-    """Generate system tray icons. Returns (empty, filled, blue) PIL Images."""
+    """Generate system tray icons. Returns (empty, filled, blue, green) PIL Images."""
     empty = _generate_dot_image((180, 180, 180, 255), filled=False)
     filled = _generate_dot_image((180, 180, 180, 255), filled=True)
     blue = _generate_dot_image((59, 130, 246, 255), filled=True)
-    return empty, filled, blue
+    green = _generate_dot_image((34, 197, 94, 255), filled=True)
+    return empty, filled, blue, green
 
 
 _emoji_font_cache = {}
@@ -175,10 +220,18 @@ def _generate_emoji_ring_icon(emoji_char, ring_color, size=64):
     return image
 
 
+def _is_safe_id(value):
+    """Check that a value is safe to use as a path component (no traversal)."""
+    return bool(value) and bool(_SAFE_ID.match(value))
+
+
 def _rmtree(path):
-    """Remove a directory tree, ignoring errors."""
+    """Remove a directory tree, ignoring errors. Refuses to follow symlinks."""
     try:
-        shutil.rmtree(path)
+        if os.path.islink(path):
+            os.unlink(path)
+        else:
+            shutil.rmtree(path)
     except Exception:
         pass
 
@@ -193,13 +246,17 @@ def _pid_alive(pid):
 
 class ClaudeHelperApp:
     def __init__(self):
-        self.icon_empty, self.icon_filled, self.icon_blue = _ensure_icons()
+        self.icon_empty, self.icon_filled, self.icon_blue, self.icon_green = _ensure_icons()
         self.sessions = {}
         self.pending_requests = {}
-        self._discover_counter = DISCOVER_EVERY  # trigger on first poll
         self._running = True
         self._lock = threading.Lock()
         self._icon_cache = {}  # (emoji, ring_color) → PIL Image
+
+        # Animation frames for "working" state (gray fill/unfill cycle)
+        self._anim_frames = self._generate_animation_frames()
+        self._anim_index = 0
+        self._anim_active = False
 
         # Build initial menu
         menu = self._build_menu()
@@ -213,10 +270,35 @@ class ClaudeHelperApp:
         self._cleanup_stale_sessions()
 
     def run(self):
-        """Start the app. Runs the polling loop in a background thread."""
+        """Start the app. Runs polling and animation loops in background threads."""
         poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         poll_thread.start()
+        anim_thread = threading.Thread(target=self._animation_loop, daemon=True)
+        anim_thread.start()
         self.icon.run()
+
+    def _generate_animation_frames(self, num_steps=10):
+        """Pre-generate frames for the working-state fill animation."""
+        color = (180, 180, 180, 255)  # gray
+        frames = []
+        # Fill up: 0/10, 1/10, ..., 10/10
+        for i in range(num_steps + 1):
+            frames.append(_generate_fill_frame(color, i / num_steps))
+        # Bounce back down: 9/10, 8/10, ..., 1/10 (skip endpoints)
+        for i in range(num_steps - 1, 0, -1):
+            frames.append(_generate_fill_frame(color, i / num_steps))
+        return frames
+
+    def _animation_loop(self):
+        """Background loop that cycles animation frames when active."""
+        while self._running:
+            if self._anim_active:
+                self._anim_index = (self._anim_index + 1) % len(self._anim_frames)
+                try:
+                    self.icon.icon = self._anim_frames[self._anim_index]
+                except Exception:
+                    pass
+            time.sleep(0.2)
 
     def _poll_loop(self):
         """Background polling loop."""
@@ -229,10 +311,6 @@ class ClaudeHelperApp:
 
     def _poll(self):
         with self._lock:
-            self._discover_counter += 1
-            if self._discover_counter >= DISCOVER_EVERY:
-                self._discover_counter = 0
-                self._discover_unregistered_sessions()
             self._read_sessions()
             self._cleanup_dead_sessions()
             self._read_pending_requests()
@@ -245,6 +323,8 @@ class ClaudeHelperApp:
         if not os.path.isdir(SESSIONS_DIR):
             return
         for session_id in os.listdir(SESSIONS_DIR):
+            if not _is_safe_id(session_id):
+                continue
             info_file = os.path.join(SESSIONS_DIR, session_id, "info.json")
             if not os.path.isfile(info_file):
                 continue
@@ -267,106 +347,13 @@ class ClaudeHelperApp:
             del self.sessions[session_id]
             _rmtree(os.path.join(SESSIONS_DIR, session_id))
 
-    def _discover_unregistered_sessions(self):
-        """Find running Claude processes not yet registered via hooks."""
-        try:
-            claude_pids = []
-            for proc in psutil.process_iter(["pid", "name"]):
-                try:
-                    name = proc.info["name"] or ""
-                    if name.lower() in ("claude.exe", "claude"):
-                        claude_pids.append(proc.info["pid"])
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-
-            if not claude_pids:
-                return
-
-            # Filter out PIDs already registered
-            registered_pids = {
-                data.get("parent_pid") for data in self.sessions.values()
-            }
-            unregistered = [p for p in claude_pids if p not in registered_pids]
-            if not unregistered:
-                return
-
-            # Get working directories
-            pid_cwd = {}
-            for pid in unregistered:
-                try:
-                    proc = psutil.Process(pid)
-                    pid_cwd[pid] = proc.cwd()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-
-            for pid, cwd in pid_cwd.items():
-                # Map cwd to Claude project directory
-                # Normalize path separators for all platforms
-                project_dir_name = cwd.replace(":", "-").replace("\\", "-").replace("/", "-")
-                project_dir = os.path.join(CLAUDE_PROJECTS_DIR, project_dir_name)
-                if not os.path.isdir(project_dir):
-                    continue
-
-                # Find the most recently modified session .jsonl file
-                best_sid = None
-                best_mtime = 0
-                try:
-                    for fname in os.listdir(project_dir):
-                        if not fname.endswith(".jsonl"):
-                            continue
-                        fpath = os.path.join(project_dir, fname)
-                        try:
-                            mtime = os.path.getmtime(fpath)
-                            if mtime > best_mtime:
-                                best_mtime = mtime
-                                best_sid = fname[:-6]  # strip .jsonl
-                        except OSError:
-                            continue
-                except OSError:
-                    continue
-
-                if not best_sid or best_sid in self.sessions:
-                    continue
-
-                # Register the discovered session (only if not already on disk)
-                session_dir = os.path.join(SESSIONS_DIR, best_sid)
-                info_file = os.path.join(session_dir, "info.json")
-                if os.path.isfile(info_file):
-                    # Hook already created this session — update PID only
-                    try:
-                        with open(info_file, "r") as f:
-                            info = json.load(f)
-                        info["parent_pid"] = pid
-                        with open(info_file, "w") as f:
-                            json.dump(info, f, indent=4)
-                    except (json.JSONDecodeError, IOError):
-                        pass
-                    continue
-
-                os.makedirs(os.path.join(session_dir, "pending"), exist_ok=True)
-                info = {
-                    "session_id": best_sid,
-                    "cwd": cwd,
-                    "project_name": os.path.basename(cwd),
-                    "parent_pid": pid,
-                    "status": "working",
-                    "waiting_for": None,
-                    "last_updated": int(time.time()),
-                }
-                try:
-                    with open(info_file, "w") as f:
-                        json.dump(info, f, indent=4)
-                except IOError:
-                    continue
-
-        except Exception:
-            pass
-
     def _read_pending_requests(self):
         self.pending_requests = {}
         if not os.path.isdir(SESSIONS_DIR):
             return
         for session_id in os.listdir(SESSIONS_DIR):
+            if not _is_safe_id(session_id):
+                continue
             pending_dir = os.path.join(SESSIONS_DIR, session_id, "pending")
             if not os.path.isdir(pending_dir):
                 continue
@@ -378,6 +365,8 @@ class ClaudeHelperApp:
                     with open(filepath, "r") as f:
                         data = json.load(f)
                     request_id = data.get("id", filename[:-5])
+                    if not _is_safe_id(request_id):
+                        continue
                     data["_session_id"] = session_id
                     self.pending_requests[request_id] = data
                 except (json.JSONDecodeError, IOError):
@@ -405,7 +394,9 @@ class ClaudeHelperApp:
         for request_id in stale_ids:
             req = self.pending_requests.pop(request_id, None)
             if req:
-                sid = req.get("session_id", req.get("_session_id", ""))
+                sid = req.get("_session_id", "")
+                if not _is_safe_id(sid) or not _is_safe_id(request_id):
+                    continue
                 pending_file = os.path.join(SESSIONS_DIR, sid, "pending", f"{request_id}.json")
                 try:
                     os.unlink(pending_file)
@@ -417,7 +408,8 @@ class ClaudeHelperApp:
 
         Blue ring + emoji = needs attention (permission / question)
         Filled gray dot   = session idle/done (user should check)
-        Hollow gray ring  = no sessions or all working
+        Animated fill     = sessions working (gray circle fills/unfills)
+        Hollow gray ring  = no sessions
 
         Icon is driven ONLY by info.json status — pending files never
         influence icon state (they are sub-menu content only).
@@ -425,6 +417,7 @@ class ClaudeHelperApp:
         # Find the highest-priority notable status
         for status in ("question", "permission", "done", "idle"):
             if any(s.get("status") == status for s in self.sessions.values()):
+                self._anim_active = False
                 if status in ("question", "permission"):
                     emoji = self._get_status_icon(status)
                     ring_color = (59, 130, 246, 255)   # blue
@@ -439,6 +432,14 @@ class ClaudeHelperApp:
                     self.icon.icon = self.icon_filled
                 return
 
+        # Sessions exist but all are "working" → animated gray fill/unfill
+        if self.sessions:
+            if not self._anim_active:
+                self._anim_index = 0
+                self._anim_active = True
+            return
+
+        self._anim_active = False
         self.icon.icon = self.icon_empty
 
     def _rebuild_menu(self):
@@ -565,7 +566,9 @@ class ClaudeHelperApp:
         return callback
 
     def _write_decision(self, request_id, decision):
-        os.makedirs(RESPONSES_DIR, exist_ok=True)
+        if not _is_safe_id(request_id):
+            return
+        os.makedirs(RESPONSES_DIR, mode=0o700, exist_ok=True)
         response_file = os.path.join(RESPONSES_DIR, f"{request_id}.json")
         response = {"id": request_id, "decision": decision, "timestamp": time.time()}
         try:
@@ -583,7 +586,9 @@ class ClaudeHelperApp:
         return callback
 
     def _write_elicitation_answer(self, request_id, question_index, selected_label):
-        os.makedirs(RESPONSES_DIR, exist_ok=True)
+        if not _is_safe_id(request_id):
+            return
+        os.makedirs(RESPONSES_DIR, mode=0o700, exist_ok=True)
         response_file = os.path.join(RESPONSES_DIR, f"{request_id}.json")
         answers = {}
         if os.path.isfile(response_file):
@@ -768,17 +773,21 @@ class ClaudeHelperApp:
             return
         now = time.time()
         for session_id in os.listdir(SESSIONS_DIR):
-            info_file = os.path.join(SESSIONS_DIR, session_id, "info.json")
+            session_path = os.path.join(SESSIONS_DIR, session_id)
+            if not _is_safe_id(session_id) or os.path.islink(session_path):
+                _rmtree(session_path)
+                continue
+            info_file = os.path.join(session_path, "info.json")
             if not os.path.isfile(info_file):
-                _rmtree(os.path.join(SESSIONS_DIR, session_id))
+                _rmtree(session_path)
                 continue
             try:
                 with open(info_file, "r") as f:
                     data = json.load(f)
                 if now - data.get("last_updated", 0) > STALE_THRESHOLD:
-                    _rmtree(os.path.join(SESSIONS_DIR, session_id))
+                    _rmtree(session_path)
             except (json.JSONDecodeError, IOError):
-                _rmtree(os.path.join(SESSIONS_DIR, session_id))
+                _rmtree(session_path)
 
     def _quit(self, icon, item):
         self._running = False
@@ -786,8 +795,9 @@ class ClaudeHelperApp:
 
 
 if __name__ == "__main__":
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    os.makedirs(RESPONSES_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(SESSIONS_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(RESPONSES_DIR, mode=0o700, exist_ok=True)
 
     app = ClaudeHelperApp()
     app.run()
