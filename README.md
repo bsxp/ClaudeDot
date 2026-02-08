@@ -1,6 +1,14 @@
 # Claude Helper
 
-A cross-platform system tray utility for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Shows session status at a glance and lets you respond to permission prompts without switching to the terminal.
+**Keep tabs on Claude Code — without leaving what you're doing.**
+
+A cross-platform system tray utility that shows what Claude is up to at a glance and lets you respond to permission prompts without switching to the terminal.
+
+<p align="center">
+  <img src="docs/working-animation.gif" alt="Working animation" width="64" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/screenshot-menu.png" alt="Menu screenshot" height="180" />
+</p>
 
 Works on **macOS** and **Windows**.
 
