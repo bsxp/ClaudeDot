@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# claudedot — launch the Claude Helper system tray app
+set -euo pipefail
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+VENV_PYTHON="$HOME/.claude-helper/venv/bin/python"
+
+# Resolve symlinks portably (macOS readlink lacks -f)
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    # Handle relative symlink
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+if [ "${1:-}" = "stop" ]; then
+    PID=$(pgrep -f "claude_helper.py" || true)
+    if [ -n "$PID" ]; then
+        kill "$PID"
+        echo -e "${RED}Claude dot stopped.${RESET} ${DIM}(PID $PID)${RESET}"
+    else
+        echo -e "${YELLOW}Claude dot is not running.${RESET}"
+    fi
+    exit 0
+fi
+
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo -e "${RED}Error: Claude Helper venv not found. Run setup.sh first.${RESET}" >&2
+    exit 1
+fi
+
+if [ ! -f "$SCRIPT_DIR/claude_helper.py" ]; then
+    echo -e "${RED}Error: claude_helper.py not found in $SCRIPT_DIR${RESET}" >&2
+    exit 1
+fi
+
+nohup "$VENV_PYTHON" "$SCRIPT_DIR/claude_helper.py" "$@" >/dev/null 2>&1 &
+disown
+echo -e "${GREEN}Claude dot started!${RESET} ${DIM}(PID $!)${RESET}"
+echo -e "  ${DIM}To stop: claudedot stop (or quit from the menu bar)${RESET}"
